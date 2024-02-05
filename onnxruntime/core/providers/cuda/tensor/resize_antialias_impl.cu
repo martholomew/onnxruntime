@@ -450,10 +450,6 @@ void ResizeAntiAliasImpl(
         });
 #endif
       } else if (is_3D) {
-        float d_scaled_support, h_scaled_support, w_scaled_support;
-        std::tie(d_scaled_support, h_scaled_support, w_scaled_support) = scaled_support_vals;
-        int32_t d_window_size, h_window_size, w_window_size;
-        std::tie(d_window_size, h_window_size, w_window_size) = window_sizes;
 #ifdef CPU_TESTING
         for (int64_t id = 0, lim = output_height + output_width; id < lim; ++id) {
           DISPATCH_ANTIALIAS_FILTER_SETUP(coordinate_transform_mode, [&]() {
@@ -467,8 +463,8 @@ void ResizeAntiAliasImpl(
                 std::make_tuple(roi_vals[rank - 3], roi_vals[rank - 2], roi_vals[rank - 1]),  // roi starts d, h, w
                 std::make_tuple(roi_vals[rank - 3 + rank], roi_vals[rank - 2 + rank],         // roi ends d, h, w
                                 roi_vals[rank - 1 + rank]),
-                std::make_tuple(d_scaled_support, h_scaled_support, w_scaled_support),
-                std::make_tuple(d_window_size, h_window_size, w_window_size),
+                scaled_support_vals,
+                window_sizes,
                 onnxruntime::narrow<size_t>(output_depth + output_height + output_width),
                 bounds_buffer.data(),
                 out_of_bounds_buffer.data(),
@@ -488,8 +484,8 @@ void ResizeAntiAliasImpl(
               std::make_tuple(roi_vals[rank - 3], roi_vals[rank - 2], roi_vals[rank - 1]),  // roi starts d, h, w
               std::make_tuple(roi_vals[rank - 3 + rank], roi_vals[rank - 2 + rank],         // roi ends d, h, w
                               roi_vals[rank - 1 + rank]),
-              std::make_tuple(d_scaled_support, h_scaled_support, w_scaled_support),
-              std::make_tuple(d_window_size, h_window_size, w_window_size),
+              scaled_support_vals,
+              window_sizes,
               onnxruntime::narrow<size_t>(output_depth + output_height + output_width),
               bounds_buffer.data(),
               out_of_bounds_buffer.data(),

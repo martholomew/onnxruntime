@@ -277,7 +277,7 @@ Status Upsample<T>::ComputeInternal(OpKernelContext* context) const {
 
   ComputeROIWithAxes(roi_array, input_dims.size());
 
-  InlinedVector<float> scales_array;
+  InlinedVector<float> scales_array(input_dims.size());
   // opset < 10
   if (OpKernel::Node().InputDefs().size() == 1) {
     // Compute output shape from scales attributes and input dims
