@@ -91,10 +91,12 @@ void ResizeAntiAliasImpl(
     ResizeCoordinateTransformationMode coordinate_transform_mode,
     gsl::span<const int64_t> input_shape,
     gsl::span<const int64_t> output_shape,
+    std::tuple<int64_t, int64_t, int64_t> inferred_input_dims,
+    std::tuple<int64_t, int64_t, int64_t> inferred_output_dims,
+    std::tuple<float, float, float> inferred_dim_scales,
     // const TArray<int64_t>& input_strides,
     const TArray<fast_divmod>& output_div_pitches,
     gsl::span<const float> roi_vals,  // CPU
-    gsl::span<const float> scales_vals, // CPU
     // const std::optional<T>& extrapolation_value,
     bool exclude_outside,
     std::tuple<float, float, float> scaled_support_vals, // d, y, h

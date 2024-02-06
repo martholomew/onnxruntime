@@ -125,86 +125,207 @@ Status Upsample<T>::BaseCompute(OpKernelContext* context,
     }
 
     if (antialias_) {
-      // Allocate buffers
-      const bool is_2D = (rank == 2 || rank == 4);
-      const bool is_3D = (rank == 3 || rank == 5);
-      assert(is_2D || is_3D);
-      assert(!(is_2D && is_3D));
-
-      const int64_t input_depth = is_3D ? X_dims[rank - 3] : 0;
-      const int64_t input_height = X_dims[rank - 2];
-      const int64_t input_width = X_dims[rank - 1];
-
-      const int64_t output_depth = is_3D ? output_dims[rank - 3] : 0;
-      const int64_t output_height = output_dims[rank - 2];
-      const int64_t output_width = output_dims[rank - 1];
-
       /// Test on CPU first
       AllocatorPtr allocator_ptr;
       ORT_RETURN_IF_ERROR(context->GetTempSpaceCPUAllocator(&allocator_ptr));
 
-      if (is_2D) {  // This covers bilinear and Cubic calls, as they are both 2-D
-        const float support_value = (mode_ == UpsampleMode::CUBIC) ? kBiCubicSupportSize : kSupportSize;
+      switch (mode_) {
+        case UpsampleMode::LINEAR: {
+          // Allocate buffers
+          if (X_dims.size() == 2 || X_dims.size() == 4) {
+            const bool is_2D = X_dims.size() == 2;
 
-        // allocate in out/bounds buffer
-        SafeInt<int64_t> bounds_buffer_size = (SafeInt<int64_t>(output_height) + output_width) * 2;
-        SafeInt<int64_t> out_of_bounds_buffer_size = (SafeInt<int64_t>(output_height) + output_width);
+            int64_t batch_size = 1;
+            int64_t num_channels = 1;
 
-        float h_scaled_support, w_scaled_support;
-        int32_t h_window_size, w_window_size;
-        const int64_t weighted_buffer_size = ComputeBilinearScaleBufferSize(output_height, output_width,
-                                                                            scales[0], scales[1], support_value,
-                                                                            h_scaled_support, w_scaled_support, h_window_size, w_window_size);
+            int64_t input_height;
+            int64_t input_width;
 
-        auto bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, bounds_buffer_size);
-        auto out_of_bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, out_of_bounds_buffer_size);
-        auto weighted_buffer = IAllocator::MakeUniquePtr<typename AccumulateType<T>::type>(allocator_ptr, weighted_buffer_size);
+            int64_t output_height;
+            int64_t output_width;
 
-        ResizeAntiAliasImpl(Stream(context), rank, mode_, coordinate_transform_mode_,
-                             X_dims, output_dims,
-                             output_div_pitches,
-                             roi, scales, exclude_outside_,
-                             std::make_tuple(0.f, h_scaled_support, w_scaled_support),
-                             std::make_tuple(0, h_window_size, w_window_size),
-                             gsl::make_span(bounds_buffer.get(), static_cast<size_t>(bounds_buffer_size)),
-                             gsl::make_span(out_of_bounds_buffer.get(), static_cast<size_t>(out_of_bounds_buffer_size)),
-                             gsl::make_span(weighted_buffer.get(), static_cast<size_t>(weighted_buffer_size)),
-                             reinterpret_cast<const CudaT*>(X->Data<T>()),
-                             reinterpret_cast<CudaT*>(Y->MutableData<T>()),
-                             output_count);
+            float height_scale;
+            float width_scale;
 
-      } else if (is_3D) {
-        const float support_value = kSupportSize;
+            if (is_2D) {  // This covers bilinear and Cubic calls, as they are both 2-D
+              input_height = X_dims[0];
+              input_width = X_dims[1];
 
-        // allocate in out/bounds buffer
-        SafeInt<int64_t> bounds_buffer_size = (SafeInt<int64_t>(output_depth) + output_height + output_width) * 2;
-        SafeInt<int64_t> out_of_bounds_buffer_size = (SafeInt<int64_t>(output_depth) + output_height + output_width);
+              output_height = output_dims[0];
+              output_width = output_dims[1];
 
-        float d_scaled_support, h_scaled_support, w_scaled_support;
-        int32_t d_window_size, h_window_size, w_window_size;
-        const int64_t weighted_buffer_size = ComputeTrilinearScaleBufferSize(output_height, output_width, output_depth,
-                                                                             scales[0], scales[1], scales[2], support_value,
-                                                                             d_scaled_support, h_scaled_support, w_scaled_support,
-                                                                             d_window_size, h_window_size, w_window_size);
+              height_scale = scales[0];
+              width_scale = scales[1];
+            } else {
+              if (scales[1] == 1.0f) {
+                batch_size = X_dims[0];
+                num_channels = X_dims[1];
+                input_height = X_dims[2];
+                input_width = X_dims[3];
 
-        auto bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, bounds_buffer_size);
-        auto out_of_bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, out_of_bounds_buffer_size);
-        auto weighted_buffer = IAllocator::MakeUniquePtr<typename AccumulateType<T>::type>(allocator_ptr, weighted_buffer_size);
+                output_height = output_dims[2];
+                output_width = output_dims[3];
 
-        ResizeAntiAliasImpl(Stream(context), rank, mode_, coordinate_transform_mode_,
-                            X_dims, output_dims,
-                            output_div_pitches,
-                            roi, scales, exclude_outside_,
-                            std::make_tuple(d_scaled_support, h_scaled_support, w_scaled_support),
-                            std::make_tuple(d_window_size, h_window_size, w_window_size),
-                            gsl::make_span(bounds_buffer.get(), static_cast<size_t>(bounds_buffer_size)),
-                            gsl::make_span(out_of_bounds_buffer.get(), static_cast<size_t>(out_of_bounds_buffer_size)),
-                            gsl::make_span(weighted_buffer.get(), static_cast<size_t>(weighted_buffer_size)),
-                            reinterpret_cast<const CudaT*>(X->Data<T>()),
-                            reinterpret_cast<CudaT*>(Y->MutableData<T>()),
-                            output_count);
+                height_scale = scales[2];
+                width_scale = scales[3];
+              } else {
+                ORT_RETURN_IF_NOT(scales[3] == 1.0f, "4-D input with innermost scale (usually channel of NHWC) as 1.");
+                // is_nchw = false;
+                // We are not implementing it yet.
+                assert(false);
+                batch_size = X_dims[0];
+                num_channels = X_dims[3];
+                input_height = X_dims[1];
+                input_width = X_dims[2];
+
+                output_height = output_dims[1];
+                output_width = output_dims[2];
+
+                height_scale = scales[1];
+                width_scale = scales[2];
+              }
+            }
+
+            const float support_value = kSupportSize;
+            // allocate in out/bounds buffer
+            SafeInt<int64_t> bounds_buffer_size = (SafeInt<int64_t>(output_height) + output_width) * 2;
+            SafeInt<int64_t> out_of_bounds_buffer_size = (SafeInt<int64_t>(output_height) + output_width);
+
+            float h_scaled_support, w_scaled_support;
+            int32_t h_window_size, w_window_size;
+            const int64_t weighted_buffer_size = ComputeBilinearScaleBufferSize(output_height, output_width,
+                                                                                height_scale, width_scale, support_value,
+                                                                                h_scaled_support, w_scaled_support, h_window_size, w_window_size);
+
+            auto bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, bounds_buffer_size);
+            auto out_of_bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, out_of_bounds_buffer_size);
+            auto weighted_buffer = IAllocator::MakeUniquePtr<typename AccumulateType<T>::type>(allocator_ptr, weighted_buffer_size);
+
+            ResizeAntiAliasImpl(Stream(context), rank, mode_, coordinate_transform_mode_,
+                                X_dims, output_dims,
+                                std::make_tuple(0, input_height, input_width),
+                                std::make_tuple(0, output_height, output_width),
+                                std::make_tuple(0.f, height_scale, width_scale),
+                                output_div_pitches,
+                                roi, exclude_outside_,
+                                std::make_tuple(0.f, h_scaled_support, w_scaled_support),
+                                std::make_tuple(0, h_window_size, w_window_size),
+                                gsl::make_span(bounds_buffer.get(), static_cast<size_t>(bounds_buffer_size)),
+                                gsl::make_span(out_of_bounds_buffer.get(), static_cast<size_t>(out_of_bounds_buffer_size)),
+                                gsl::make_span(weighted_buffer.get(), static_cast<size_t>(weighted_buffer_size)),
+                                reinterpret_cast<const CudaT*>(X->Data<T>()),
+                                reinterpret_cast<CudaT*>(Y->MutableData<T>()),
+                                output_count);
+
+          } else if (X_dims.size() == 3 || X_dims.size() == 5) {
+            const bool is_3D = X_dims.size() == 3;
+
+            const int64_t batch_size = is_3D ? 1 : X_dims[0];
+            const int64_t num_channels = is_3D ? 1 : X_dims[1];
+            const int64_t input_depth = is_3D ? X_dims[0] : X_dims[2];
+            const int64_t input_height = is_3D ? X_dims[1] : X_dims[3];
+            const int64_t input_width = is_3D ? X_dims[2] : X_dims[4];
+
+            const int64_t output_depth = is_3D ? output_dims[0] : output_dims[2];
+            const int64_t output_height = is_3D ? output_dims[1] : output_dims[3];
+            const int64_t output_width = is_3D ? output_dims[2] : output_dims[4];
+
+            const float depth_scale = is_3D ? scales[0] : scales[2];
+            const float height_scale = is_3D ? scales[1] : scales[3];
+            const float width_scale = is_3D ? scales[2] : scales[4];
+
+            const float support_value = kSupportSize;
+            // allocate in out/bounds buffer
+            SafeInt<int64_t> bounds_buffer_size = (SafeInt<int64_t>(output_depth) + output_height + output_width) * 2;
+            SafeInt<int64_t> out_of_bounds_buffer_size = (SafeInt<int64_t>(output_depth) + output_height + output_width);
+
+            float d_scaled_support, h_scaled_support, w_scaled_support;
+            int32_t d_window_size, h_window_size, w_window_size;
+            const int64_t weighted_buffer_size = ComputeTrilinearScaleBufferSize(output_height, output_width, output_depth,
+                                                                                 depth_scale, height_scale, width_scale, support_value,
+                                                                                 d_scaled_support, h_scaled_support, w_scaled_support,
+                                                                                 d_window_size, h_window_size, w_window_size);
+
+            auto bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, bounds_buffer_size);
+            auto out_of_bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, out_of_bounds_buffer_size);
+            auto weighted_buffer = IAllocator::MakeUniquePtr<typename AccumulateType<T>::type>(allocator_ptr, weighted_buffer_size);
+
+            ResizeAntiAliasImpl(Stream(context), rank, mode_, coordinate_transform_mode_,
+                                X_dims, output_dims,
+                                std::make_tuple(input_depth, input_height, input_width),
+                                std::make_tuple(output_depth, output_height, output_width),
+                                std::make_tuple(depth_scale, height_scale, width_scale),
+                                output_div_pitches,
+                                roi, exclude_outside_,
+                                std::make_tuple(d_scaled_support, h_scaled_support, w_scaled_support),
+                                std::make_tuple(d_window_size, h_window_size, w_window_size),
+                                gsl::make_span(bounds_buffer.get(), static_cast<size_t>(bounds_buffer_size)),
+                                gsl::make_span(out_of_bounds_buffer.get(), static_cast<size_t>(out_of_bounds_buffer_size)),
+                                gsl::make_span(weighted_buffer.get(), static_cast<size_t>(weighted_buffer_size)),
+                                reinterpret_cast<const CudaT*>(X->Data<T>()),
+                                reinterpret_cast<CudaT*>(Y->MutableData<T>()),
+                                output_count);
+          } else {
+            return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Resize",
+                                   ": 'Linear' mode only support 2-D inputs or 3-D inputs ('Bilinear', 'Trilinear') "
+                                   "or 4-D inputs or 5-D inputs with the corresponding outermost 2 scale values "
+                                   "being 1.");
+          }
+        } break;
+        case UpsampleMode::CUBIC: {
+          if (X_dims.size() != 2 && X_dims.size() != 4) {
+            return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, (is_resize_ ? "Resize" : "Upsample"),
+                                   ": 'Cubic' mode only support 2-D inputs ('Bicubic') or 4-D inputs "
+                                   "with the corresponding outermost 2 scale values being 1.");
+          }
+
+          const bool is_2D = X_dims.size() == 2;
+          const bool is_nchw = is_2D ? true : (scales[1] == 1.0f);
+          assert(is_nchw);  // We are not implementing it yet.
+
+          const int64_t batch_size = is_2D ? 1 : X_dims[0];
+          const int64_t num_channels = is_2D ? 1 : (is_nchw ? X_dims[1] : X_dims[3]);
+          const int64_t input_height = is_2D ? X_dims[0] : (is_nchw ? X_dims[2] : X_dims[1]);
+          const int64_t input_width = is_2D ? X_dims[1] : (is_nchw ? X_dims[3] : X_dims[2]);
+          const int64_t output_height = is_2D ? output_dims[0] : (is_nchw ? output_dims[2] : output_dims[1]);
+          const int64_t output_width = is_2D ? output_dims[1] : (is_nchw ? output_dims[3] : output_dims[2]);
+          const float height_scale = is_2D ? scales[0] : (is_nchw ? scales[2] : scales[1]);
+          const float width_scale = is_2D ? scales[1] : (is_nchw ? scales[3] : scales[2]);
+
+          const float support_value = kBiCubicSupportSize;
+          SafeInt<int64_t> bounds_buffer_size = (SafeInt<int64_t>(output_height) + output_width) * 2;
+          SafeInt<int64_t> out_of_bounds_buffer_size = (SafeInt<int64_t>(output_height) + output_width);
+
+          float h_scaled_support, w_scaled_support;
+          int32_t h_window_size, w_window_size;
+          const int64_t weighted_buffer_size = ComputeBilinearScaleBufferSize(output_height, output_width,
+                                                                              height_scale, width_scale, support_value,
+                                                                              h_scaled_support, w_scaled_support, h_window_size, w_window_size);
+
+          auto bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, bounds_buffer_size);
+          auto out_of_bounds_buffer = IAllocator::MakeUniquePtr<int64_t>(allocator_ptr, out_of_bounds_buffer_size);
+          auto weighted_buffer = IAllocator::MakeUniquePtr<typename AccumulateType<T>::type>(allocator_ptr, weighted_buffer_size);
+
+          ResizeAntiAliasImpl(Stream(context), rank, mode_, coordinate_transform_mode_,
+                              X_dims, output_dims,
+                              std::make_tuple(0, input_height, input_width),
+                              std::make_tuple(0, output_height, output_width),
+                              std::make_tuple(0.f, height_scale, width_scale),
+                              output_div_pitches,
+                              roi, exclude_outside_,
+                              std::make_tuple(0.f, h_scaled_support, w_scaled_support),
+                              std::make_tuple(0, h_window_size, w_window_size),
+                              gsl::make_span(bounds_buffer.get(), static_cast<size_t>(bounds_buffer_size)),
+                              gsl::make_span(out_of_bounds_buffer.get(), static_cast<size_t>(out_of_bounds_buffer_size)),
+                              gsl::make_span(weighted_buffer.get(), static_cast<size_t>(weighted_buffer_size)),
+                              reinterpret_cast<const CudaT*>(X->Data<T>()),
+                              reinterpret_cast<CudaT*>(Y->MutableData<T>()),
+                              output_count);
+
+        } break;
+        default:
+          return Status(ONNXRUNTIME, FAIL, is_resize_ ? "Resize: unexpected mode" : "Upsample: unexpected mode");
       }
-
     } else {
       TArray<int64_t> input_shape(X_dims);
       TArray<int64_t> output_shape(output_dims);

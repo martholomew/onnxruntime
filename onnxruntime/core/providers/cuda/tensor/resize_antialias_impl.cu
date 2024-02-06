@@ -72,9 +72,8 @@ struct TriLinearFilter {
 /// </summary>
 template <typename AccumType, typename Filter, typename CudaFunctionOriginalCoordinate>
 __device__ __host__ void SetupUpsampleFilterAnitAliasImpl(
-    IdType id,
     int64_t input_size, int64_t output_size,
-    float inv_scale,
+    float rscale,
     float roi_start, float roi_end,
     float scaled_support, int32_t window_size, bool exclude_outside,
     float cubic_coeff_a,
@@ -84,73 +83,79 @@ __device__ __host__ void SetupUpsampleFilterAnitAliasImpl(
   Filter filter{};
   CudaFunctionOriginalCoordinate get_original_coordinate{};
 
-  const float scale = 1.0f / inv_scale;
-  const float center = 0.5f + (scale == 1.0f) ? static_cast<float>(id)
-                                              : get_original_coordinate(static_cast<float>(id), inv_scale,
-                                                                        static_cast<float>(output_size),
-                                                                        static_cast<float>(input_size),
-                                                                        roi_start, roi_end);
+  int64_t min_val = 0, max_val = 0;
+  const auto scale = 1.f / rscale;
+  const float inv_scale = (scale >= 1.0f) ? 1.0f / scale : 1.0f;
 
-  if (center - 0.5f < 0 || center - 0.5f > static_cast<float>(input_size - 1)) {
-    out_of_bounds[id] = id;
-  } else {
-    out_of_bounds[id] = -1;
-  }
+  for (size_t i = 0; i < static_cast<size_t>(output_size); i++) {
+    const float id = static_cast<float>(i);
+    const float center = 0.5f + (scale == 1.0f) ? id
+                                                : get_original_coordinate(id, rscale,
+                                                                          static_cast<float>(output_size),
+                                                                          static_cast<float>(input_size),
+                                                                          roi_start, roi_end);
 
-  AccumType total_weight{0};
-
-  auto fmin = _Floor(center - scaled_support + 0.5f);
-  auto fmax = _Floor(center + scaled_support + 0.5f);
-
-  int64_t min_real = static_cast<int64_t>(fmin);
-  int64_t max_real = static_cast<int64_t>(fmax);
-  int64_t min_cut = std::max(min_real, 0LL);
-  int64_t max_cut = std::min(max_real, input_size);
-
-  auto min_val = exclude_outside ? min_cut : min_real;
-  auto max_val = exclude_outside ? max_cut : max_real;
-  bounds[id * 2] = min_cut;
-  bounds[id * 2 + 1] = max_cut;
-
-  auto* scale_buffer = &scale_data[id * window_size];
-
-  int64_t x = 0;
-  max_val -= min_val;
-  for (; x < max_val; x++) {
-    auto w = filter((x + min_val - center + 0.5f) * inv_scale, cubic_coeff_a);
-    scale_buffer[x] = static_cast<AccumType>(w);
-    total_weight += static_cast<AccumType>(w);
-  }
-
-  if (!exclude_outside) {
-    int64_t neg_xsize = min_val < 0 ? -min_val : 0;
-    for (x = 0; x < neg_xsize; x++) {
-      scale_buffer[neg_xsize] += scale_buffer[x];
+    if (center - 0.5f < 0 || center - 0.5f > static_cast<float>(input_size - 1)) {
+      out_of_bounds[i] = i;
+    } else {
+      out_of_bounds[i] = -1;
     }
 
-    int64_t bound_size =
-        max_val + min_val > input_size ? max_val + min_val - input_size : 0;
-    for (x = max_val - bound_size; x < max_val; x++) {
-      scale_buffer[max_val - bound_size - 1] +=
-          scale_buffer[x];
+    AccumType total_weight{0};
+
+    auto fmin = _Floor(center - scaled_support + 0.5f);
+    auto fmax = _Floor(center + scaled_support + 0.5f);
+
+    int64_t min_real = static_cast<int64_t>(fmin);
+    int64_t max_real = static_cast<int64_t>(fmax);
+    int64_t min_cut = std::max(min_real, 0LL);
+    int64_t max_cut = std::min(max_real, input_size);
+
+    min_val = exclude_outside ? min_cut : min_real;
+    max_val = exclude_outside ? max_cut : max_real;
+    bounds[i * 2] = min_cut;
+    bounds[i * 2 + 1] = max_cut;
+
+    auto* scale_buffer = &scale_data[i * window_size];
+
+    int64_t x = 0;
+    max_val -= min_val;
+    for (; x < max_val; x++) {
+      auto w = filter((x + min_val - center + 0.5f) * inv_scale, cubic_coeff_a);
+      scale_buffer[x] = static_cast<AccumType>(w);
+      total_weight += static_cast<AccumType>(w);
     }
 
-    for (x = 0; (neg_xsize | bound_size) > 0 && x < max_cut - min_cut; x++) {
-      scale_buffer[x] = scale_buffer[x + neg_xsize];
-    }
-  }
+    if (!exclude_outside) {
+      int64_t neg_xsize = min_val < 0 ? -min_val : 0;
+      for (x = 0; x < neg_xsize; x++) {
+        scale_buffer[neg_xsize] += scale_buffer[x];
+      }
 
-  const AccumType total_weight_inv = (total_weight == 0) ? AccumType{1} : (AccumType{1} / total_weight);
-  if constexpr (std::is_same<AccumType, int32_t>::value) {
-    auto* scale_buffer_int = reinterpret_cast<int32_t*>(scale_buffer);
-    for (x = 0; x < max_cut - min_cut; x++) {
-      scale_buffer[x] *= total_weight_inv;
-      // normalize the scale to 1 << 22 for int8/uint8
-      scale_buffer_int[x] = static_cast<int32_t>(_Round(scale_buffer[x] * ConstValue::mag_factor * 2.f));
+      int64_t bound_size =
+          max_val + min_val > input_size ? max_val + min_val - input_size : 0;
+      for (x = max_val - bound_size; x < max_val; x++) {
+        scale_buffer[max_val - bound_size - 1] +=
+            scale_buffer[x];
+      }
+
+      for (x = 0; (neg_xsize | bound_size) > 0 && x < max_cut - min_cut; x++) {
+        scale_buffer[x] = scale_buffer[x + neg_xsize];
+      }
     }
-  } else {
-    for (x = 0; x < max_cut - min_cut; x++) {
-      scale_buffer[x] *= total_weight_inv;
+
+    const AccumType total_weight_inv = (total_weight == 0) ? AccumType{1} : (AccumType{1} / total_weight);
+    if constexpr (std::is_same<AccumType, int32_t>::value) {
+      auto* scale_buffer_int = reinterpret_cast<int32_t*>(scale_buffer);
+      for (x = 0; x < max_cut - min_cut; x++) {
+        scale_buffer[x] *= total_weight_inv;
+        // normalize the scale to 1 << 22 for int8/uint8
+        scale_buffer_int[x] = static_cast<int32_t>(_Round(scale_buffer[x] * ConstValue::mag_factor * 2.f));
+      }
+    } else {
+      for (x = 0; x < max_cut - min_cut; x++) {
+        scale_buffer[x] *= total_weight_inv;
+      }
     }
   }
 }
@@ -181,49 +186,63 @@ __global__ void _SetupBilinearUpsampleFilterAntiAlias(
     AccumType* weighted_coefficients) {  // computed weighted coefficients
 
 #ifndef CPU_TESTING
-  CALCULATE_ELEMENTWISE_INDEX_OR_EXIT(id, SumHW);
+  int32_t id = blockDim.x * blockIdx.x + threadIdx.x;
 #endif
 
-  // Setup for y
-  int64_t input_size = std::get<0>(input_dims);
-  int64_t output_size = std::get<0>(output_dims);
-  float inv_scale = std::get<0>(inv_scale_vals);
-  float roi_start = std::get<0>(roi_start_vals);
-  float roi_end = std::get<0>(roi_end_vals);
-  float scaled_support = std::get<0>(dim_scaled_support);
-  int32_t window_size = std::get<0>(dim_window_size);
+  // We let only run 1 thread for each dim
+  if (id != 0 && id != std::get<0>(output_dims)) {
+    return;
+  }
 
-  // id >= output_height
-  if (id >= std::get<0>(output_dims)) {
+  if (id == 0) {
+    // Setup for y
+    int64_t input_size = std::get<0>(input_dims);
+    int64_t output_size = std::get<0>(output_dims);
+    float inv_scale = std::get<0>(inv_scale_vals);
+    float roi_start = std::get<0>(roi_start_vals);
+    float roi_end = std::get<0>(roi_end_vals);
+    float scaled_support = std::get<0>(dim_scaled_support);
+    int32_t window_size = std::get<0>(dim_window_size);
+
+    SetupUpsampleFilterAnitAliasImpl<AccumType, Filter, CudaFunctionOriginalCoordinate>(
+        input_size, output_size,
+        inv_scale,
+        roi_start, roi_end,
+        scaled_support, window_size,
+        exclude_outside,
+        cubic_coeff_a,
+        bounds,
+        out_of_bounds,
+        weighted_coefficients);
+
+  } else {
     // Setup for w
     // w = id - output_height
-    id = id - std::get<0>(output_dims);
-    input_size = std::get<1>(input_dims);
-    output_size = std::get<1>(output_dims);
-    inv_scale = std::get<1>(inv_scale_vals);
-    roi_start = std::get<1>(roi_start_vals);
-    roi_end = std::get<1>(roi_end_vals);
+    int64_t input_size = std::get<1>(input_dims);
+    int64_t output_size = std::get<1>(output_dims);
+    float inv_scale = std::get<1>(inv_scale_vals);
+    float roi_start = std::get<1>(roi_start_vals);
+    float roi_end = std::get<1>(roi_end_vals);
 
-    scaled_support = std::get<1>(dim_scaled_support);
-    window_size = std::get<1>(dim_window_size);
+    float scaled_support = std::get<1>(dim_scaled_support);
+    int32_t window_size = std::get<1>(dim_window_size);
 
     // Adjust buffer positions
     bounds += (output_size * 2);
     out_of_bounds += output_size;
     weighted_coefficients += (output_size * window_size);
-  }
 
-  SetupUpsampleFilterAnitAliasImpl<AccumType, Filter, CudaFunctionOriginalCoordinate>(
-      static_cast<int>(id),
-      input_size, output_size,
-      inv_scale,
-      roi_start, roi_end,
-      scaled_support, window_size,
-      exclude_outside,
-      cubic_coeff_a,
-      bounds,
-      out_of_bounds,
-      weighted_coefficients);
+    SetupUpsampleFilterAnitAliasImpl<AccumType, Filter, CudaFunctionOriginalCoordinate>(
+        input_size, output_size,
+        inv_scale,
+        roi_start, roi_end,
+        scaled_support, window_size,
+        exclude_outside,
+        cubic_coeff_a,
+        bounds,
+        out_of_bounds,
+        weighted_coefficients);
+  }
 }
 
 /// <summary>
@@ -253,70 +272,88 @@ __global__ void _SetupTrilinerarUpsampleFilterAntiAlias(
     AccumType* weighted_coefficients) {
 
 #ifndef CPU_TESTING
-  CALCULATE_ELEMENTWISE_INDEX_OR_EXIT(id, SumDHW);
+  int32_t id = blockDim.x * blockIdx.x + threadIdx.x;
 #endif
+
+  // We let only run 1 thread for each dim
+  if (id != 0 && id != std::get<0>(output_dims) &&
+      id != (std::get<0>(output_dims) + std::get<1>(output_dims))) {
+    return;
+  }
 
   const auto output_depth = std::get<0>(output_dims);
 
-  // Setup for d by default (id < output_depth)
-  int64_t input_size = std::get<0>(input_dims);
-  int64_t output_size = std::get<0>(output_dims);
-  float inv_scale = std::get<0>(inv_scale_vals);
-  float roi_start = std::get<2>(roi_start_vals);
-  float roi_end = std::get<0>(roi_end_vals);
-  float scaled_support = std::get<0>(dim_scaled_support);
-  int32_t window_size = std::get<0>(dim_window_size);
+  if (id == 0) {
+    // Setup for d by default (id < output_depth)
+    int64_t input_size = std::get<0>(input_dims);
+    int64_t output_size = std::get<0>(output_dims);
+    float inv_scale = std::get<0>(inv_scale_vals);
+    float roi_start = std::get<2>(roi_start_vals);
+    float roi_end = std::get<0>(roi_end_vals);
+    float scaled_support = std::get<0>(dim_scaled_support);
+    int32_t window_size = std::get<0>(dim_window_size);
 
-  if (id >= output_depth && id < (output_depth + std::get<1>(output_dims))) {
-    // Setup for y - height
+    SetupUpsampleFilterAnitAliasImpl<AccumType, Filter, CudaFunctionOriginalCoordinate>(
+        input_size, output_size,
+        inv_scale,
+        roi_start, roi_end,
+        scaled_support, window_size,
+        true,                       // exclude outside for trilinear
+        onnxruntime::kCubicCoeffA,  // Default value for trilinear
+        bounds,
+        out_of_bounds,
+        weighted_coefficients);
 
-    // y = id - output_depth
-    id = id - output_depth;
-    input_size = std::get<1>(input_dims);
-    output_size = std::get<1>(output_dims);
-    inv_scale = std::get<1>(inv_scale_vals);
-    roi_start = std::get<1>(roi_start_vals);
-    roi_end = std::get<1>(roi_end_vals);
+  } else if (id == std::get<0>(output_dims)) {
+    int64_t input_size = std::get<1>(input_dims);
+    int64_t output_size = std::get<1>(output_dims);
+    float inv_scale = std::get<1>(inv_scale_vals);
+    float roi_start = std::get<1>(roi_start_vals);
+    float roi_end = std::get<1>(roi_end_vals);
+
+    float scaled_support = std::get<1>(dim_scaled_support);
+    int32_t window_size = std::get<1>(dim_window_size);
 
     // Adjust buffer positions
-    scaled_support = std::get<1>(dim_scaled_support);
-    window_size = std::get<1>(dim_window_size);
-
     bounds += output_size * 2;
     out_of_bounds += output_size;
     weighted_coefficients += (output_size * window_size);
 
-  } else if (id > output_depth) {  // means we are out of bounds for the second for the first if on the right side
-    // Setup for x
-
-    // x = id - output_depth - output_height
-    id = id - output_depth - std::get<1>(output_dims);
-    input_size = std::get<2>(input_dims);
-    output_size = std::get<2>(output_dims);
-    inv_scale = std::get<2>(inv_scale_vals);
-    roi_start = std::get<2>(roi_start_vals);
-    roi_end = std::get<2>(roi_end_vals);
+    SetupUpsampleFilterAnitAliasImpl<AccumType, Filter, CudaFunctionOriginalCoordinate>(
+        input_size, output_size,
+        inv_scale,
+        roi_start, roi_end,
+        scaled_support, window_size,
+        true,                       // exclude outside for trilinear
+        onnxruntime::kCubicCoeffA,  // Default value for trilinear
+        bounds,
+        out_of_bounds,
+        weighted_coefficients);
+  } else {
+    int64_t input_size = std::get<2>(input_dims);
+    int64_t output_size = std::get<2>(output_dims);
+    float inv_scale = std::get<2>(inv_scale_vals);
+    float roi_start = std::get<2>(roi_start_vals);
+    float roi_end = std::get<2>(roi_end_vals);
+    float scaled_support = std::get<2>(dim_scaled_support);
+    int32_t window_size = std::get<2>(dim_window_size);
 
     // Adjust buffer positions
-    scaled_support = std::get<2>(dim_scaled_support);
-    window_size = std::get<2>(dim_window_size);
-
     bounds += (output_size * 4);
     out_of_bounds += (output_size * 2);
     weighted_coefficients += output_size * window_size * 2;
-  }
 
-  SetupUpsampleFilterAnitAliasImpl<AccumType, Filter, CudaFunctionOriginalCoordinate>(
-      id,
-      input_size, output_size,
-      inv_scale,
-      roi_start, roi_end,
-      scaled_support, window_size,
-      true,                       // exclude outside for trilinear
-      onnxruntime::kCubicCoeffA,  // Default value for trilinear
-      bounds,
-      out_of_bounds,
-      weighted_coefficients);
+    SetupUpsampleFilterAnitAliasImpl<AccumType, Filter, CudaFunctionOriginalCoordinate>(
+        input_size, output_size,
+        inv_scale,
+        roi_start, roi_end,
+        scaled_support, window_size,
+        true,                       // exclude outside for trilinear
+        onnxruntime::kCubicCoeffA,  // Default value for trilinear
+        bounds,
+        out_of_bounds,
+        weighted_coefficients);
+  }
 }
 
 #define CASEA_COORD_ANTIALIAS(coordinate_mode, TransformCoordType, ...) \
@@ -349,10 +386,12 @@ void ResizeAntiAliasImpl(
     ResizeCoordinateTransformationMode coordinate_transform_mode,
     gsl::span<const int64_t> input_shape,
     gsl::span<const int64_t> output_shape,
+    std::tuple<int64_t, int64_t, int64_t> inferred_input_dims,
+    std::tuple<int64_t, int64_t, int64_t> inferred_output_dims,
+    std::tuple<float, float, float> inferred_dim_scales,
     // const TArray<int64_t>& input_strides,
     const TArray<fast_divmod>& output_div_pitches,
     gsl::span<const float> roi_vals,
-    gsl::span<const float> scales_vals,
     // const std::optional<T>& extrapolation_value,
     bool exclude_outside,
     std::tuple<float, float, float> scaled_support_vals,                       // d, y, h
@@ -385,13 +424,12 @@ void ResizeAntiAliasImpl(
     div_output_image = (rank > 3) ? output_div_pitches[rank - 4] : fast_divmod(gsl::narrow_cast<int>(N));
   }
 
-  const int64_t input_depth = is_3D ? input_shape[rank - 3] : 0;
-  const int64_t input_height = input_shape[rank - 2];
-  const int64_t input_width = input_shape[rank - 1];
+  int64_t input_depth, input_height, input_width;
+  std::tie(input_depth, input_height, input_width) = inferred_input_dims;
 
-  const int64_t output_depth = is_3D ? output_shape[rank - 3] : 0;
-  const int64_t output_height = output_shape[rank - 2];
-  const int64_t output_width = output_shape[rank - 1];
+  int64_t output_depth, output_height, output_width;
+  std::tie(output_depth, output_height, output_width) = inferred_output_dims;
+
   int blocksPerDimsMappingGrid =
       static_cast<int>(ceil((output_depth + output_height + output_width) / 32.0));
 
@@ -403,6 +441,9 @@ void ResizeAntiAliasImpl(
         int32_t h_window_size, w_window_size;
         std::tie(std::ignore, h_window_size, w_window_size) = window_sizes;
 
+        float h_scale, w_scale;
+        std::tie(std::ignore, h_scale, w_scale) = inferred_dim_scales;
+
 #ifdef CPU_TESTING
 
         for (int64_t id = 0, lim = output_height + output_width; id < lim; ++id) {
@@ -413,7 +454,7 @@ void ResizeAntiAliasImpl(
                 narrow<int32_t>(id),
                 std::make_tuple(input_height, input_width),
                 std::make_tuple(output_height, output_width),
-                std::make_tuple(scales_vals[rank - 2], scales_vals[rank - 1]),
+                std::make_tuple(h_scale, w_scale),
                 std::make_tuple(roi_vals[rank - 2], roi_vals[rank - 1]),                // roi starts h, w
                 std::make_tuple(roi_vals[rank - 2 + rank], roi_vals[rank - 1 + rank]),  // roi ends h, w
                 std::make_tuple(h_scaled_support, w_scaled_support),
@@ -430,14 +471,14 @@ void ResizeAntiAliasImpl(
 
 #else
         DISPATCH_ANTIALIAS_FILTER_SETUP(coordinate_transform_mode, [&]() {
-        //  Data is d, h, w in tuples
+          //  Data is d, h, w in tuples
 
           _SetupBilinearUpsampleFilterAntiAlias<AccumType,
                                                 BilinearFilter,
                                                 coord_t><<<blocksPerDimsMappingGrid, 32, 0, stream>>>(
               std::make_tuple(input_height, input_width),
               std::make_tuple(output_height, output_width),
-              std::make_tuple(scales_vals[rank - 2], scales_vals[rank - 1]),
+              std::make_tuple(h_scale, w_scale),
               std::make_tuple(roi_vals[rank - 2], roi_vals[rank - 1]),                // roi starts h, w
               std::make_tuple(roi_vals[rank - 2 + rank], roi_vals[rank - 1 + rank]),  // roi ends h, w
               std::make_tuple(h_scaled_support, w_scaled_support),
@@ -450,6 +491,7 @@ void ResizeAntiAliasImpl(
         });
 #endif
       } else if (is_3D) {
+
 #ifdef CPU_TESTING
         for (int64_t id = 0, lim = output_height + output_width; id < lim; ++id) {
           DISPATCH_ANTIALIAS_FILTER_SETUP(coordinate_transform_mode, [&]() {
@@ -457,9 +499,9 @@ void ResizeAntiAliasImpl(
                                                     TriLinearFilter,
                                                     coord_t>(
                 narrow<int32_t>(id),
-                std::make_tuple(input_depth, input_height, input_width),
-                std::make_tuple(output_depth, output_height, output_width),
-                std::make_tuple(scales_vals[rank - 3], scales_vals[rank - 2], scales_vals[rank - 1]),
+                inferred_input_dims,
+                inferred_output_dims,
+                inferred_dim_scales,
                 std::make_tuple(roi_vals[rank - 3], roi_vals[rank - 2], roi_vals[rank - 1]),  // roi starts d, h, w
                 std::make_tuple(roi_vals[rank - 3 + rank], roi_vals[rank - 2 + rank],         // roi ends d, h, w
                                 roi_vals[rank - 1 + rank]),
@@ -478,9 +520,9 @@ void ResizeAntiAliasImpl(
           _SetupTrilinerarUpsampleFilterAntiAlias<AccumType,
                                                   TriLinearFilter,
                                                   coord_t><<<blocksPerDimsMappingGrid, 32, 0, stream>>>(
-              std::make_tuple(input_depth, input_height, input_width),
-              std::make_tuple(output_depth, output_height, output_width),
-              std::make_tuple(scales_vals[rank - 3], scales_vals[rank - 2], scales_vals[rank - 1]),
+              inferred_input_dims,
+              inferred_output_dims,
+              inferred_dim_scales,
               std::make_tuple(roi_vals[rank - 3], roi_vals[rank - 2], roi_vals[rank - 1]),  // roi starts d, h, w
               std::make_tuple(roi_vals[rank - 3 + rank], roi_vals[rank - 2 + rank],         // roi ends d, h, w
                               roi_vals[rank - 1 + rank]),
@@ -502,6 +544,10 @@ void ResizeAntiAliasImpl(
         int32_t h_window_size, w_window_size;
         std::tie(std::ignore, h_window_size, w_window_size) = window_sizes;
 
+        float h_scale, w_scale;
+        std::tie(std::ignore, h_scale, w_scale) = inferred_dim_scales;
+
+
 #ifdef CPU_TESTING
 
         for (int64_t id = 0, lim = output_height + output_width; id < lim; ++id) {
@@ -512,7 +558,7 @@ void ResizeAntiAliasImpl(
                 narrow<int32_t>(id),
                 std::make_tuple(input_height, input_width),
                 std::make_tuple(output_height, output_width),
-                std::make_tuple(scales_vals[rank - 2], scales_vals[rank - 1]),
+                std::make_tuple(h_scale, w_scale),
                 std::make_tuple(roi_vals[rank - 2], roi_vals[rank - 1]),                // roi starts h, w
                 std::make_tuple(roi_vals[rank - 2 + rank], roi_vals[rank - 1 + rank]),  // roi ends h, w
                 std::make_tuple(h_scaled_support, w_scaled_support),
@@ -526,13 +572,13 @@ void ResizeAntiAliasImpl(
         }
         PrintAntiAliasBuffers(std::cout, bounds_buffer, out_of_bounds_buffer, weighted_buffer);
 #else
-          DISPATCH_ANTIALIAS_FILTER_SETUP(coordinate_transform_mode, [&]() {
+        DISPATCH_ANTIALIAS_FILTER_SETUP(coordinate_transform_mode, [&]() {
           _SetupBilinearUpsampleFilterAntiAlias<AccumType,
                                                 BiCubicFilter,
                                                 coord_t><<<blocksPerDimsMappingGrid, 32, 0, stream>>>(
               std::make_tuple(input_height, input_width),
               std::make_tuple(output_height, output_width),
-              std::make_tuple(scales_vals[rank - 2], scales_vals[rank - 1]),
+              std::make_tuple(h_scale, w_scale),
               std::make_tuple(roi_vals[rank - 2], roi_vals[rank - 1]),                // roi starts h, w
               std::make_tuple(roi_vals[rank - 2 + rank], roi_vals[rank - 1 + rank]),  // roi ends h, w
               std::make_tuple(h_scaled_support, w_scaled_support),
@@ -554,25 +600,27 @@ void ResizeAntiAliasImpl(
   }
 }
 
-#define SPECIALIZED_ANTIALIAS_IMPL(T)                                                        \
-  template void ResizeAntiAliasImpl<T>(                                                      \
-      cudaStream_t stream,                                                                   \
-      int rank,                                                                              \
-      const UpsampleMode upsample_mode,                                                      \
-      ResizeCoordinateTransformationMode coordinate_transform_mode,                          \
-      gsl::span<const int64_t> input_shape,                                                  \
-      gsl::span<const int64_t> output_shape, /* const TArray<int64_t>& input_strides, */     \
-      const TArray<fast_divmod>& output_div_pitches,                                         \
-      gsl::span<const float> roi_vals,                                                       \
-      gsl::span<const float> scales_vals, /* const std::optional<T>& extrapolation_value, */ \
-      bool exclude_outside,                                                                  \
-      std::tuple<float, float, float> scaled_support_vals,                                   \
-      std::tuple<int32_t, int32_t, int32_t> window_sizes,                                    \
-      gsl::span<int64_t> bounds_buffer,                                                      \
-      gsl::span<int64_t> out_of_bounds_buffer,                                               \
-      gsl::span<typename onnxruntime::AccumulateType<T>::type> weighted_buffer,              \
-      const T* input_data,                                                                   \
-      T* output_data,                                                                        \
+#define SPECIALIZED_ANTIALIAS_IMPL(T)                                                                  \
+  template void ResizeAntiAliasImpl<T>(                                                                \
+      cudaStream_t stream,                                                                             \
+      int rank,                                                                                        \
+      const UpsampleMode upsample_mode,                                                                \
+      ResizeCoordinateTransformationMode coordinate_transform_mode,                                    \
+      gsl::span<const int64_t> input_shape,                                                            \
+      gsl::span<const int64_t> output_shape,                                                           \
+      std::tuple<int64_t, int64_t, int64_t> inferred_input_dims,                                       \
+      std::tuple<int64_t, int64_t, int64_t> inferred_output_dims,                                      \
+      std::tuple<float, float, float> inferred_dim_scales, /* const TArray<int64_t>& input_strides, */ \
+      const TArray<fast_divmod>& output_div_pitches,                                                   \
+      gsl::span<const float> roi_vals, /* const std::optional<T>& extrapolation_value, */              \
+      bool exclude_outside,                                                                            \
+      std::tuple<float, float, float> scaled_support_vals,                                             \
+      std::tuple<int32_t, int32_t, int32_t> window_sizes,                                              \
+      gsl::span<int64_t> bounds_buffer,                                                                \
+      gsl::span<int64_t> out_of_bounds_buffer,                                                         \
+      gsl::span<typename onnxruntime::AccumulateType<T>::type> weighted_buffer,                        \
+      const T* input_data,                                                                             \
+      T* output_data,                                                                                  \
       const size_t N);
 
 SPECIALIZED_ANTIALIAS_IMPL(float)
